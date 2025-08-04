@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from datetime import datetime
 from neo4j import GraphDatabase
@@ -20,9 +21,14 @@ def log_step_end(step):
 # === Step 1: Read CSV ===
 step = "Step 1: Reading CSV"
 log_step_start(step)
-csv_path = "/home/dell/Jagan/LnTDatascience/cleaning_outputs/cleaned_data.csv"
+# Allow users to override the CSV location via the ``CSV_PATH`` environment
+# variable so the script is portable.
+csv_path = os.environ.get("CSV_PATH", "cleaned_data.csv")
 df = pd.read_csv(csv_path, low_memory=False)
-print(f"📦 Read {df.shape[0]} rows and {df.shape[1]} columns")
+# Replace pandas missing values with ``None`` to avoid Neo4j errors when
+# setting properties.
+df = df.where(pd.notnull(df), None)
+print(f"📦 Read {df.shape[0]} rows and {df.shape[1]} columns from {csv_path}")
  
 print("\n🔎 Unique ID counts per label:")
 print(f"PurchaseOrder IDs : {df['ID'].nunique()}")
@@ -152,63 +158,102 @@ with driver.session() as session:
 log_step_end(step)
  
 # === Step 8: Create Relationships ===
-step = "Step 8: Creating Relationships"
-log_step_start(step)
- 
-def create_relationships(tx):
-    tx.run("""
-        MATCH (po:PurchaseOrder), (m:Material)
-        WHERE po.MRNNumber = m.MRNNumber AND po.MRNItemNumber = m.MRNItemNumber
+def create_relationship(session, rel_label, columns, query, chunk_size=20000):
+    """Create relationships in batches driven by the source DataFrame."""
+    step = f"Step 8: Creating {rel_label} Relationships"
+    log_step_start(step)
+    rows = df[columns].dropna(subset=columns).drop_duplicates().to_dict("records")
+    for i in tqdm(range(0, len(rows), chunk_size), desc=rel_label):
+        batch = rows[i:i + chunk_size]
+        session.execute_write(lambda tx: tx.run(query, batch=batch))
+    log_step_end(step)
+
+with driver.session() as session:
+    create_relationship(session, "ORDERS", ["ID", "MRNNumber", "MRNItemNumber"], """
+        UNWIND $batch AS row
+        MATCH (po:PurchaseOrder {ID: row.ID})
+        MATCH (m:Material {MRNNumber: row.MRNNumber, MRNItemNumber: row.MRNItemNumber})
         MERGE (po)-[:ORDERS]->(m)
     """)
-    tx.run("""
-        MATCH (po:PurchaseOrder), (w:Warehouse)
-        WHERE po.WarehouseLocation = w.WarehouseLocation
+
+    create_relationship(session, "DELIVERED_TO", ["ID", "WarehouseLocation"], """
+        UNWIND $batch AS row
+        MATCH (po:PurchaseOrder {ID: row.ID})
+        MATCH (w:Warehouse {WarehouseLocation: row.WarehouseLocation})
         MERGE (po)-[:DELIVERED_TO]->(w)
     """)
-    tx.run("""
-        MATCH (po:PurchaseOrder), (v:Vendor)
-        WHERE po.VendorCode = v.VendorCode
+
+    create_relationship(session, "PROCURED_FROM", ["ID", "VendorCode"], """
+        UNWIND $batch AS row
+        MATCH (po:PurchaseOrder {ID: row.ID})
+        MATCH (v:Vendor {VendorCode: row.VendorCode})
         MERGE (po)-[:PROCURED_FROM]->(v)
     """)
-    tx.run("""
-        MATCH (po:PurchaseOrder), (bu:BusinessUnit)
-        WHERE po.BusinessUnitCode = bu.BusinessUnitCode
+
+    create_relationship(session, "RAISED_BY", ["ID", "BusinessUnitCode"], """
+        UNWIND $batch AS row
+        MATCH (po:PurchaseOrder {ID: row.ID})
+        MATCH (bu:BusinessUnit {BusinessUnitCode: row.BusinessUnitCode})
         MERGE (po)-[:RAISED_BY]->(bu)
     """)
-    tx.run("""
-        MATCH (m:Material), (w:Warehouse)
-        WHERE m.WarehouseLocation = w.WarehouseLocation
+
+    create_relationship(session, "STORED_IN", ["MaterialCode", "WarehouseLocation"], """
+        UNWIND $batch AS row
+        MATCH (m:Material {MaterialCode: row.MaterialCode})
+        MATCH (w:Warehouse {WarehouseLocation: row.WarehouseLocation})
         MERGE (m)-[:STORED_IN]->(w)
     """)
-    tx.run("""
-        MATCH (m:Material), (v:Vendor)
-        WHERE m.VendorCode = v.VendorCode
+
+    create_relationship(session, "SUPPLIED_BY", ["MaterialCode", "VendorCode"], """
+        UNWIND $batch AS row
+        MATCH (m:Material {MaterialCode: row.MaterialCode})
+        MATCH (v:Vendor {VendorCode: row.VendorCode})
         MERGE (m)-[:SUPPLIED_BY]->(v)
     """)
-    tx.run("""
-        MATCH (v:Vendor), (bu:BusinessUnit)
-        WHERE v.BusinessUnitCode = bu.BusinessUnitCode
+
+    create_relationship(session, "SUPPLIES_TO", ["VendorCode", "BusinessUnitCode"], """
+        UNWIND $batch AS row
+        MATCH (v:Vendor {VendorCode: row.VendorCode})
+        MATCH (bu:BusinessUnit {BusinessUnitCode: row.BusinessUnitCode})
         MERGE (v)-[:SUPPLIES_TO]->(bu)
     """)
-    tx.run("""
-        MATCH (w:Warehouse), (bu:BusinessUnit)
-        WHERE w.BusinessUnitCode = bu.BusinessUnitCode
+
+    create_relationship(session, "BELONGS_TO", ["WarehouseLocation", "BusinessUnitCode"], """
+        UNWIND $batch AS row
+        MATCH (w:Warehouse {WarehouseLocation: row.WarehouseLocation})
+        MATCH (bu:BusinessUnit {BusinessUnitCode: row.BusinessUnitCode})
         MERGE (w)-[:BELONGS_TO]->(bu)
     """)
- 
+
+# === Step 9: Confirm Relationship Counts ===
+step = "Step 9: Confirming Relationship Counts"
+log_step_start(step)
 with driver.session() as session:
-    session.execute_write(create_relationships)
- 
+    rel_counts = session.run("""
+        MATCH (:PurchaseOrder)-[o:ORDERS]->(:Material) WITH count(o) AS ORDERS
+        MATCH (:PurchaseOrder)-[d:DELIVERED_TO]->(:Warehouse) WITH ORDERS, count(d) AS DELIVERED_TO
+        MATCH (:PurchaseOrder)-[p:PROCURED_FROM]->(:Vendor) WITH ORDERS, DELIVERED_TO, count(p) AS PROCURED_FROM
+        MATCH (:PurchaseOrder)-[r:RAISED_BY]->(:BusinessUnit) WITH ORDERS, DELIVERED_TO, PROCURED_FROM, count(r) AS RAISED_BY
+        MATCH (:Material)-[s:STORED_IN]->(:Warehouse) WITH ORDERS, DELIVERED_TO, PROCURED_FROM, RAISED_BY, count(s) AS STORED_IN
+        MATCH (:Material)-[sb:SUPPLIED_BY]->(:Vendor) WITH ORDERS, DELIVERED_TO, PROCURED_FROM, RAISED_BY, STORED_IN, count(sb) AS SUPPLIED_BY
+        MATCH (:Vendor)-[st:SUPPLIES_TO]->(:BusinessUnit) WITH ORDERS, DELIVERED_TO, PROCURED_FROM, RAISED_BY, STORED_IN, SUPPLIED_BY, count(st) AS SUPPLIES_TO
+        MATCH (:Warehouse)-[b:BELONGS_TO]->(:BusinessUnit)
+        RETURN ORDERS, DELIVERED_TO, PROCURED_FROM, RAISED_BY, STORED_IN, SUPPLIED_BY, SUPPLIES_TO, count(b) AS BELONGS_TO
+    """).single()
+
+    print("\n🔗 Relationship Count Summary (in Neo4j):")
+    for rel, count in rel_counts.items():
+        print(f"  {rel:<13}: {count}")
+
 log_step_end(step)
- 
+
 driver.close()
- 
+
 # === Final Summary ===
 total_time = time.time() - overall_start
 print("\n🎉 All steps completed successfully!")
 print(f"🕒 Total time elapsed: {total_time:.2f} seconds")
- 
+
 print("\n📊 Ingestion Time per Node Type:")
 for label, seconds in ingestion_times.items():
     print(f"  {label:<15}: {seconds:.2f} sec")
